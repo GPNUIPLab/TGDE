@@ -1,0 +1,570 @@
+import os
+import gzip
+import logging
+import pickle
+import random
+import sys
+from collections import namedtuple
+from importlib import reload
+
+import fire
+import numpy as np
+import torch
+from torch import nn
+
+from patent_concept.model.metrics import test
+
+Data = namedtuple(
+    "Data", ["pairs", "feature_embeddings", "concept_embeddings", "labels"]
+)
+
+
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+
+def setup_logger(file, level=logging.INFO, log_to_stdout=True):
+    logger = logging.getLogger()
+    logger.setLevel(level)
+    formatter = logging.Formatter(
+        "%(asctime)s | %(levelname)s | %(message)s", "%H:%M:%S"
+    )
+
+    if log_to_stdout:
+        stdout_handler = logging.StreamHandler(sys.stdout)
+        stdout_handler.setFormatter(formatter)
+        logger.addHandler(stdout_handler)
+
+    file_handler = logging.FileHandler(file)
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    return logger
+
+
+def flatten(t):
+    return [item for sublist in t for item in sublist]
+
+
+def load_data(data_path):
+    logger.info("Loading data")
+    with open(data_path, "rb") as f:
+        return pickle.load(f)
+
+
+def load_compressed(path):
+    if not path:
+        return None
+
+    logger.info(f"Loading compressed file {path}")
+    with gzip.open(path, "rb") as f:
+        return pickle.load(f)
+
+
+class BaselineNetwork(nn.Module):
+    def __init__(self, layer_dims: list, dropout: float, loss_fn: str = "bce"):
+        super().__init__()
+        self.loss_fn = loss_fn
+
+        layers = []
+        for in_, out_ in zip(layer_dims[:-1], layer_dims[1:], strict=False):
+            layers.append(nn.Linear(in_, out_))
+            layers.append(nn.BatchNorm1d(out_))
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout(p=dropout))
+
+        layers.pop()  # remove last dropout layer
+        layers.pop()  # remove last relu layer
+        if loss_fn != "bce_with_logits":
+            layers.append(nn.Sigmoid())
+
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        """
+        Pass throught network
+        """
+        res = self.net(x)
+
+        return res
+
+
+def euclidean_distance(vec1, vec2):
+    """Compute the Euclidean distance between two vectors."""
+    return np.linalg.norm(vec1 - vec2)
+
+
+def cosine_similarity(vec1, vec2):
+    """Compute the cosine similarity between two vectors."""
+    dot_prod = np.dot(vec1, vec2)
+    norm1 = np.linalg.norm(vec1)
+    norm2 = np.linalg.norm(vec2)
+    denom = norm1 * norm2
+    if denom < 1e-10:
+        return 0.0
+    return dot_prod / denom
+
+
+def dot_product(vec1, vec2):
+    """Compute the dot product between two vectors."""
+    return np.dot(vec1, vec2)
+
+
+def angle_between(vec1, vec2):
+    """Compute the angle (in radians) between two vectors."""
+    cosine_sim = cosine_similarity(vec1, vec2)
+    return np.arccos(np.clip(cosine_sim, -1.0, 1.0))
+
+
+def concat_embs(emb1, emb2):
+    return np.concatenate([emb1, emb2])
+
+
+def handcrafted_features(emb1, emb2):
+    a = euclidean_distance(emb1, emb2)
+    b = cosine_similarity(emb1, emb2)
+
+    return np.array([a, b])
+
+
+def product_embs(emb1, emb2):
+    return emb1 * emb2
+
+
+def abs_diff_embs(emb1, emb2):
+    return np.abs(emb1 - emb2)
+
+
+def multi_embs(emb1, emb2):
+    return np.concatenate([
+        emb1, emb2,
+        np.abs(emb1 - emb2),
+        emb1 * emb2,
+    ])
+
+
+# other approach: PCA on embeddings => 4D embedding
+
+
+def get_embeddings(
+    pairs, feature_embeddings, concept_embeddings, feature_func=concat_embs
+):
+    logger.debug(f"Getting embeddings for {len(pairs)} samples")
+
+    l = []
+    for v1, v2 in pairs:
+        i1 = int(v1.item())
+        i2 = int(v2.item())
+
+        feature_vector = []
+
+        if feature_embeddings is not None:
+            emb1_f = np.array(feature_embeddings[i1])
+            emb2_f = np.array(feature_embeddings[i2])
+
+            feature_vector.extend([emb1_f, emb2_f])
+
+        if concept_embeddings is not None:
+            emb1_c = np.array(concept_embeddings[i1])
+            emb2_c = np.array(concept_embeddings[i2])
+
+            feature_vector.append(feature_func(emb1_c, emb2_c))
+
+        l.append(np.concatenate(feature_vector))
+    return torch.tensor(np.array(l)).float()
+
+
+class EarlyStopping:
+    def __init__(self, sliding_window=5, eta=1e-4):
+        self.sliding_window = sliding_window
+        self.eta = eta
+        self.losses = []
+        self.aucs = []
+
+    def append(self, loss, auc):
+        self.losses.append(loss)
+        self.aucs.append(auc)
+
+    @property
+    def current_auc_sliding(self):
+        return np.mean(self.aucs[-self.sliding_window :])
+
+    @property
+    def previous_auc_sliding(self):
+        return np.mean(self.aucs[-self.sliding_window * 2 : -self.sliding_window])
+
+    @property
+    def current_loss_sliding(self):
+        return np.mean(self.losses[-self.sliding_window :])
+
+    @property
+    def previous_loss_sliding(self):
+        return np.mean(self.losses[-self.sliding_window * 2 : -self.sliding_window])
+
+    def should_stop_early(self):
+        if not self.sliding_window:
+            return False
+
+        if len(self.aucs) < self.sliding_window * 2:
+            return False
+
+        # current averaged auc is higher than previous averaged auc
+        if (self.current_auc_sliding - self.previous_auc_sliding) > self.eta:
+            return False
+
+        # previous averaged loss is higher than current averaged loss
+        if (self.previous_loss_sliding - self.current_loss_sliding) > self.eta:
+            return False
+
+        return True
+
+
+class Loader:
+    def __init__(self, y):
+        self.indices = torch.randperm(len(y))
+        self.count = 0
+
+    def __call__(self, batch_size):
+        if self.count > len(self.indices) - batch_size:
+            self.indices = torch.randperm(len(self.indices))
+            self.count = 0
+
+        batch = self.indices[self.count : self.count + batch_size]
+        self.count += 1
+        return batch
+
+
+class Trainer:
+    def __init__(
+        self,
+        model,
+        train_data,
+        eval_data,
+        optimizer,
+        scheduler,
+        criterion,
+        batch_size,
+        pos_ratio,
+        early_stopping,
+        log_interval,
+        emb_strategy,
+        use_loader=False,
+        eval_batch_size=None,
+    ):
+        self.model = model
+        self.train_data = train_data
+        self.eval_data = eval_data
+        self.optimizer = optimizer
+        self.scheduler = scheduler
+        self.criterion = criterion
+        self.batch_size = batch_size
+        self.pos_ratio = pos_ratio
+        self.log_interval = log_interval
+        self.early_stopping = early_stopping
+        self.use_loader = use_loader
+        self.data_loader = Loader(train_data.labels)
+        self.emb_strategy = emb_strategy
+        self.eval_batch_size = eval_batch_size if eval_batch_size else batch_size * 100
+        self.save_path = None
+        self.best_val_auc = 0.0
+
+    def train(self, num_epochs):
+        logger.info("Training model")
+
+        for epoch in range(1, num_epochs + 1):
+            loss = self._train_epoch()
+
+            if epoch % self.log_interval == 0:
+                auc, (tn, fp, fn, tp) = eval(
+                    self.model,
+                    self.eval_data,
+                    feature_func=self.emb_strategy,
+                    batch_size=self.eval_batch_size,
+                )
+
+                self.early_stopping.append(loss=loss, auc=auc)
+
+                logger.info(
+                    f"Epoch: {epoch}, Loss: {loss:.4f}, Val AUC: {auc:.4f}, TP: {tp}, FP: {fp}, FN: {fn}, TN: {tn}"
+                )
+
+                if self.save_path and auc > self.best_val_auc:
+                    self.best_val_auc = auc
+                    self._save_best()
+
+                if self.early_stopping.should_stop_early():
+                    logger.info("Early stopping triggered")
+                    break
+
+        if self.save_path:
+            self._save_final(num_epochs)
+
+    def _save_best(self):
+        best_path = f"{self.save_path}.best"
+        logger.info(f"Saving best model (AUC={self.best_val_auc:.4f}) to {best_path}")
+        torch.save(
+            {
+                "model_state_dict": self.model.state_dict(),
+                "best_val_auc": self.best_val_auc,
+            },
+            best_path,
+        )
+
+    def _save_final(self, num_epochs):
+        final_path = self.save_path
+        logger.info(f"Saving final model to {final_path}")
+        torch.save(
+            {
+                "epoch": num_epochs,
+                "model_state_dict": self.model.state_dict(),
+                "optimizer_state_dict": self.optimizer.state_dict(),
+                "scheduler_state_dict": self.scheduler.state_dict(),
+                "loss": self.early_stopping.losses[-1] if self.early_stopping.losses else None,
+                "losses": self.early_stopping.losses,
+                "aucs": self.early_stopping.aucs,
+                "best_val_auc": self.best_val_auc,
+            },
+            final_path,
+        )
+
+    def load_checkpoint(self, checkpoint_path):
+        if not checkpoint_path or not os.path.exists(checkpoint_path):
+            logger.info("No checkpoint found, starting from scratch.")
+            return 0
+
+        logger.info(f"Loading checkpoint from {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path)
+        self.model.load_state_dict(checkpoint["model_state_dict"])
+        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        self.early_stopping.losses = checkpoint.get("losses", [])
+        self.early_stopping.aucs = checkpoint.get("aucs", [])
+        start_epoch = checkpoint["epoch"] + 1
+        logger.info(f"Resuming training from epoch {start_epoch}")
+        return start_epoch
+
+    def _train_epoch(self):
+        data = self.train_data
+
+        self.model.train()
+        self.optimizer.zero_grad()
+
+        # get batch
+        if self.use_loader:
+            batch_indices = self.data_loader(self.batch_size)
+        else:
+            batch_indices = sample_batch(data.labels, self.batch_size, self.pos_ratio)
+
+        inputs = get_embeddings(
+            data.pairs[batch_indices],
+            feature_embeddings=data.feature_embeddings,
+            concept_embeddings=data.concept_embeddings,
+            feature_func=self.emb_strategy,
+        ).to(device)
+        labels = data.labels[batch_indices].to(device)
+
+        # Forward pass
+        outputs = self.model(inputs)
+        loss = self.criterion(outputs.view(-1), labels)
+
+        # Backward and optimize
+        loss.backward()
+        self.optimizer.step()
+        self.scheduler.step()
+
+        return loss.item()
+
+
+def sample_batch(y, batch_size, pos_ratio=0.5):
+    if pos_ratio is None or pos_ratio < 0:
+        # natural sampling: uniform shuffle, no positive re-balancing
+        idx = torch.randperm(len(y))
+        if len(idx) < batch_size:
+            reps = batch_size // len(idx) + 1
+            idx = idx.repeat(reps)
+        return idx[:batch_size]
+
+    pos_indices = torch.where(y == 1)[0]
+    neg_indices = torch.where(y == 0)[0]
+
+    amt_pos = int(batch_size * pos_ratio)
+    amt_neg = batch_size - amt_pos
+
+    i_pos = torch.randint(0, len(pos_indices), (amt_pos,))
+    i_neg = torch.randint(0, len(neg_indices), (amt_neg,))
+
+    batch_indices = torch.cat([pos_indices[i_pos], neg_indices[i_neg]])
+
+    # shuffle batch
+    batch_indices = batch_indices[torch.randperm(len(batch_indices))]
+    return batch_indices
+
+
+def eval(model, data: Data, feature_func, batch_size: int):
+    """Load the pytorch model and evaluate it on the test set"""
+    model.eval()
+
+    all_predictions = []
+    with torch.no_grad():
+        for i in range(0, len(data.pairs), batch_size):
+            batch_pairs = data.pairs[i : i + batch_size]
+            inputs = get_embeddings(
+                batch_pairs,
+                data.feature_embeddings,
+                data.concept_embeddings,
+                feature_func,
+            ).to(device)
+
+            predictions = model(inputs).cpu().numpy()
+            all_predictions.extend(predictions)
+
+    predictions = np.array(flatten(all_predictions))
+
+    auc, _, confusion_matrix = test(data.labels, predictions, threshold=0.5)
+    return auc, confusion_matrix
+
+
+emb_strategies = {
+    "concat": concat_embs,
+    "handcrafted": handcrafted_features,
+    "product": product_embs,
+    "abs_diff": abs_diff_embs,
+    "multi": multi_embs,
+}
+
+
+def main(
+    data_path="data/model/data.pkl",
+    emb_f_train_path=None,
+    emb_f_test_path=None,
+    emb_c_train_path=None,
+    emb_c_test_path=None,
+    emb_comb_strategy="concat",
+    lr=0.001,
+    gamma=0.8,
+    batch_size=100,
+    num_epochs=1000,
+    pos_ratio=0.3,
+    dropout=0.1,
+    layers=[1556, 1024, 512, 256, 64, 32, 16, 8, 4, 1],
+    step_size=40,
+    log_interval=10,
+    log_file="logs.log",
+    save_model=False,
+    sliding_window=5,
+    use_loader=False,
+    seed=42,
+    eval_batch_size=None,
+    checkpoint_path=None,
+    loss_fn="bce",
+    weight_decay=0.0,
+    optimizer_type="adam",
+    scheduler_type="step",
+):
+    reload(logging)
+    global logger
+    logger = setup_logger(file=log_file, level=logging.INFO, log_to_stdout=True)
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    logger.info(f"Running with seed: {seed}")
+
+
+    logger.info("Running with parameters:")
+    logger.info(f"lr: {lr}")
+    logger.info(f"batch_size: {batch_size}")
+    logger.info(f"num_epochs: {num_epochs}")
+    logger.info(f"pos_ratio: {pos_ratio}")
+    logger.info(f"dropout: {dropout}")
+    logger.info(f"layers: {layers}")
+    logger.info(f"step_size: {step_size}")
+    logger.info(f"gamma: {gamma}")
+    logger.info(f"weight_decay: {weight_decay}")
+    logger.info(f"optimizer_type: {optimizer_type}")
+    logger.info(f"scheduler_type: {scheduler_type}")
+    logger.info(f"log_interval: {log_interval}")
+    logger.info(f"sliding_window: {sliding_window}")
+    logger.info(f"use_loader: {use_loader}")
+    logger.info(f"emb_comb_strategy: {emb_comb_strategy}")
+    logger.info(f"loss_fn: {loss_fn}")
+
+    data = load_data(data_path)
+
+    features_train = load_compressed(emb_f_train_path)
+    concept_embs_train = load_compressed(emb_c_train_path)
+    if isinstance(concept_embs_train, dict) and "v_features" in concept_embs_train:
+        concept_embs_train = concept_embs_train["v_features"]
+    d_train = Data(
+        pairs=torch.tensor(data["X_train"]),
+        feature_embeddings=features_train["v_features"] if features_train else None,
+        concept_embeddings=concept_embs_train,
+        labels=torch.tensor(data["y_train"], dtype=torch.float),
+    )
+
+    # Validation uses the same train-time embeddings; reuse references to avoid
+    # loading a second copy (saves ~5-8 GB RAM for llm concept_embs).
+    features_val = features_train
+    concept_embs_val = concept_embs_train
+    d_val = Data(
+        pairs=torch.tensor(data["X_val"]),
+        feature_embeddings=features_val["v_features"] if features_val else None,
+        concept_embeddings=concept_embs_val,
+        labels=torch.tensor(data["y_val"], dtype=torch.float),
+    )
+
+    features_test = load_compressed(emb_f_test_path)
+    concept_embs_test = load_compressed(emb_c_test_path)
+    if isinstance(concept_embs_test, dict) and "v_features" in concept_embs_test:
+        concept_embs_test = concept_embs_test["v_features"]
+    d_test = Data(
+        pairs=torch.tensor(data["X_test"]),
+        feature_embeddings=features_test["v_features"] if features_test else None,
+        concept_embeddings=concept_embs_test,
+        labels=torch.tensor(data["y_test"], dtype=torch.float),
+    )
+
+    model = BaselineNetwork(layers, dropout, loss_fn=loss_fn).to(device)
+
+    if optimizer_type == "adamw":
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    else:
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    if scheduler_type == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=num_epochs, eta_min=0
+        )
+    else:
+        scheduler = torch.optim.lr_scheduler.StepLR(
+            optimizer, step_size=step_size, gamma=gamma
+        )
+
+    criterion = nn.BCEWithLogitsLoss() if loss_fn == "bce_with_logits" else nn.BCELoss()
+
+    trainer = Trainer(
+        model=model,
+        train_data=d_train,
+        eval_data=d_val,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        criterion=criterion,
+        batch_size=batch_size,
+        pos_ratio=pos_ratio,
+        early_stopping=EarlyStopping(sliding_window=sliding_window),
+        log_interval=log_interval,
+        use_loader=use_loader,
+        emb_strategy=emb_strategies[emb_comb_strategy],
+        eval_batch_size=eval_batch_size,
+    )
+    trainer.save_path = save_model
+    start_epoch = trainer.load_checkpoint(checkpoint_path) if checkpoint_path else 0
+    trainer.train(num_epochs - start_epoch)
+
+    if save_model:
+        torch.save(model.state_dict(), save_model)
+
+
+if __name__ == "__main__":
+    fire.Fire(main)

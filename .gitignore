@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.log
+.venv/
+venv/
+env/
+.env
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Large data artifacts
+code/patent_concept/analyze/css.pickle
+
+# Datasets (linked via link_datasets.sh)
+dataset/

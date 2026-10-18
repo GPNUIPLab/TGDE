@@ -1,0 +1,82 @@
+# ============================================================
+# patent_concept — Linux requirements (CUDA 12.1+)
+# ============================================================
+#
+# Step 1: Install PyTorch with CUDA 12.1 support FIRST:
+#   pip install torch==2.4.0 torchvision==0.19.0 --index-url https://download.pytorch.org/whl/cu121
+#
+# Step 2: Install PyG extensions matching torch+cu121:
+#   pip install torch-geometric
+#   pip install pyg_lib torch_scatter torch_sparse -f https://data.pyg.org/whl/torch-2.4.0+cu121.html
+#
+# Step 3: Install the rest:
+#   pip install -r requirements_linux.txt
+#
+# ============================================================
+
+# --- Core scientific ---
+numpy>=1.24
+pandas>=2.0
+scipy>=1.10
+scikit-learn>=1.2
+networkx>=3.0
+
+# --- PyTorch (install via Step 1 above, not here) ---
+# torch, torchvision — see Step 1
+
+# --- PyG (install via Step 2 above, not here) ---
+# torch-geometric, pyg_lib, torch-scatter, torch-sparse — see Step 2
+
+# --- NLP / Embeddings ---
+transformers>=4.28
+tokenizers>=0.13
+sentencepiece>=0.1.98
+keybert>=0.7
+rake-nltk>=1.0
+nltk>=3.8
+
+# --- Visualization ---
+matplotlib>=3.7
+seaborn>=0.12
+
+# --- CLI / Utilities ---
+fire>=0.7
+click>=8.0
+tqdm>=4.60
+loguru>=0.6
+tabulate>=0.9
+
+# --- Data / API ---
+requests>=2.28
+pyalex>=0.9
+langdetect>=1.0
+datasets>=4.0
+pyarrow>=14.0
+
+# --- ML tracking ---
+wandb>=0.15
+tensorboardX>=2.6
+
+# --- Embedding utils ---
+gensim>=4.3
+Pillow>=9.0
+
+# --- LLM fine-tuning ---
+peft>=0.4
+bitsandbytes>=0.41
+accelerate>=0.20
+
+# --- Report generation ---
+anthropic>=0.18
+openai>=1.0
+pylatex>=1.4
+opencv-python>=4.0
+umap-learn>=0.5
+
+# --- Other ---
+rocauc-comparison>=0.1
+parallel-pandas>=0.5
+ijson>=3.0
+
+# --- Test ---
+ddt>=1.6

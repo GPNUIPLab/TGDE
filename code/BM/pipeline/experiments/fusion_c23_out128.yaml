@@ -1,0 +1,19 @@
+group: fusion_concat
+description: "C23_out128 on patent (LLM): winner config with encoder out_dim 128"
+concept_source: llm
+
+# C23 = bs1024, lr=2e-4, wd=1e-3, cosine100ep, hidden512, droppath0.1,
+# norm+resid, fanout(15,10). ONLY change vs C23: out_dim 256 -> 128.
+
+experiments:
+  C23_out128_lr_2e-4:
+    model_type: gnn
+    description: "C23_out128: C23 with encoder output dimension 128 instead of 256"
+    train_cfg: "batch_size=1024,lr=2e-4,num_epochs=100,scheduler=cosine,eval_batch_size=4096,weight_decay=1e-3"
+    eval_batch_size: 4096
+    model_cfg: "hidden_dim=512,out_dim=128,dropout=0.5,decoder=mlp_two_tower,decoder_hidden_dim=512,decoder_dropout=0.4,use_norm=true,use_residual=true,decoder_drop_path=0.1"
+    sampling_cfg: "fanout1=15,fanout2=10"
+    features_cfg: "log1p=true,zscore=true"
+    concept_embs_as_features: true
+    year_start_train: 2018
+    year_start_test: 2021
