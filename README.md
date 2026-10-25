@@ -37,7 +37,7 @@ pip install -r code/requirements.txt
 
 The dataset is relatively large, so it is hosted on Google Drive instead of being included in this repository.
 
-Please download the dataset from the Google Drive link **[URL will be updated upon upload]**, extract it, and place the four dataset directories (`BM_llm/`, `BM_rake/`, `IT_llm/`, `IT_rake/`) under `TGDE/dataset/`.
+Please download the dataset from the Google Drive link **[https://drive.google.com/file/d/1Kp1NoGzWU-qaCh4uFPGhYElxQo0Fqic2/view?usp=drive_link]**, extract it, and place the four dataset directories (`BM_llm/`, `BM_rake/`, `IT_llm/`, `IT_rake/`) under `TGDE/dataset/`.
 
 After that, run `link_datasets.sh` to link the downloaded data into the code directory. The script is idempotent and requires no code changes.
 
